@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -34,14 +35,10 @@ jobs:
           python main.py
 
       - name: Commit e Push dos Dados Atualizados
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add data/
-          if git diff --staged --quiet; then
-            echo "Nenhuma alteração nos dados detectada."
-          else
-            git commit -m "chore(data): atualização mensal dos dados PNIPE [skip ci]"
-            git pull --rebase origin main
-            git push origin main
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(data): atualização mensal dos dados PNIPE [skip ci]"
+          file_pattern: "data/*"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
