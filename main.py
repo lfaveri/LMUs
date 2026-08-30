@@ -37,21 +37,30 @@ def run_pipeline(
     export_csv=True
 ) -> None:
     """
-    Executa o pipeline inteligente:
-    1. Varre a listagem de laboratórios na API.
-    2. Identifica automaticamente qualquer NOVO idAsset ou laboratórios com enriquecimento pendente.
-    3. Executa a raspagem dos detalhes e equipamentos apenas dos novos/pendentes (ou de todos com --all).
-    4. Salva e incrementa os dados no banco SQLite local e atualiza CSVs.
+    Executa o pipeline:
+    1. Primeira execução: extrai tudo (listagem + detalhes + equipamentos de todos os laboratórios).
+    2. Execuções seguintes: consulta a listagem, identifica os idAssets que NÃO estão na base,
+       e para estes novos, executa a raspagem completa (detalhes + equipamentos) e incrementa a base.
     """
     logger.info("==================================================")
-    logger.info("   PIPELINE INCREMENTAL PNIPE/MCTI (SQL LOCAL)   ")
+    logger.info("   PIPELINE PNIPE/MCTI (LABORATÓRIOS E EQUIPAMENTOS)   ")
     logger.info("==================================================")
     
     start_time = time.time()
     init_db(DATABASE_PATH)
 
+    # Verifica o estado atual da base antes da raspagem
+    initial_stats = get_database_stats(DATABASE_PATH)
+    is_first_run = (initial_stats["laboratorios_enriquecidos"] == 0)
+
+    if is_first_run:
+        logger.info("ℹ️ PRIMEIRA EXECUÇÃO DETECTADA: O pipeline irá extrair todos os dados completos (laboratórios e equipamentos).")
+    else:
+        logger.info(f"ℹ️ BASE EXISTENTE DETECTADA ({initial_stats['total_laboratorios']} laboratórios, {initial_stats['total_equipamentos']} equipamentos).")
+        logger.info("   O pipeline fará a consulta rápida e apenas raspará detalhes/equipamentos de idAssets NOVOS.")
+
     # ----------------------------------------------------
-    # ETAPA 1: Raspagem da Listagem de Laboratórios
+    # ETAPA 1: Consulta da Listagem de Laboratórios
     # ----------------------------------------------------
     logger.info("\n--- [ETAPA 1/2] Sincronização da Lista de Laboratórios ---")
     new_lab_ids: List[int] = []
@@ -60,7 +69,7 @@ def run_pipeline(
         lab_records = fetch_pnipe_laboratorios(max_pages=max_pages, page_size=PAGE_SIZE)
         new_lab_ids, upd_labs_count = upsert_laboratorios_base(lab_records, DATABASE_PATH)
         
-        logger.info(f"Resultado da listagem: {len(new_lab_ids)} novos laboratórios encontrados | {upd_labs_count} existentes atualizados.")
+        logger.info(f"Resultado da listagem: {len(new_lab_ids)} novos idAssets encontrados | {upd_labs_count} existentes atualizados.")
         
         # Atualiza CSV simples de laboratórios
         if export_csv and lab_records:
@@ -79,7 +88,7 @@ def run_pipeline(
         raise
 
     # ----------------------------------------------------
-    # ETAPA 2: Detalhes e Equipamentos (Incremental Automático)
+    # ETAPA 2: Detalhes e Equipamentos
     # ----------------------------------------------------
     total_enriched = 0
     new_eq, upd_eq = 0, 0
@@ -87,27 +96,24 @@ def run_pipeline(
     if not skip_enrichment:
         logger.info("\n--- [ETAPA 2/2] Raspagem de Detalhes e Equipamentos ---")
         
-        if force_all:
-            # Força o enriquecimento de todos os laboratórios do banco
-            target_ids = get_all_lab_ids(DATABASE_PATH)
-            logger.info(f"Modo --all ativado: {len(target_ids)} laboratórios serão enriquecidos.")
+        if force_all or is_first_run:
+            # Na primeira execução (ou com --all), processa todos os laboratórios pendentes
+            target_ids = get_pending_enrichment_lab_ids(DATABASE_PATH)
+            if not target_ids and force_all:
+                target_ids = get_all_lab_ids(DATABASE_PATH)
+            logger.info(f"Modo carga completa/inicial: {len(target_ids)} laboratórios selecionados para raspagem completa de equipamentos.")
         else:
-            # Modo padrão: novos IDs encontrados + quaisquer pendentes de execuções anteriores
-            pending_ids = get_pending_enrichment_lab_ids(DATABASE_PATH)
-            target_ids = list(dict.fromkeys(new_lab_ids + pending_ids))
-            
+            # Nas execuções seguintes, processa APENAS os novos idAssets que acabaram de ser descobertos
+            target_ids = new_lab_ids
             if target_ids:
-                logger.info(
-                    f"Alvos para enriquecimento: {len(target_ids)} laboratórios "
-                    f"({len(new_lab_ids)} novos idAssets + {len(pending_ids) - len(new_lab_ids)} pendentes)."
-                )
+                logger.info(f"⚡ {len(target_ids)} NOVO(S) idAsset(s) identificado(s)! Iniciando raspagem de detalhes e equipamentos...")
             else:
-                logger.info("Nenhum novo laboratório detectado e nenhum pendente de enriquecimento.")
+                logger.info("✅ Nenhum novo idAsset encontrado na API. Todos os laboratórios já estão salvos e enriquecidos na base.")
 
         if target_ids:
             if max_enrich is not None:
                 target_ids = target_ids[:max_enrich]
-                logger.info(f"Limitando enriquecimento aos primeiros {len(target_ids)} laboratórios (--max-enrich).")
+                logger.info(f"Limitando aos primeiros {len(target_ids)} laboratórios (--max-enrich).")
 
             try:
                 total_enriched, new_eq, upd_eq = enrich_laboratories(
@@ -128,12 +134,12 @@ def run_pipeline(
         logger.info("Etapa 2 ignorada (--skip-enrichment solicitado).")
 
     duration = time.time() - start_time
-    stats = get_database_stats(DATABASE_PATH)
+    final_stats = get_database_stats(DATABASE_PATH)
 
     # Registrar execução no banco
     log_scraping_run(
-        job_type="INCREMENTAL_SYNC",
-        total_extracted=stats["total_laboratorios"],
+        job_type="INITIAL_FULL_SYNC" if is_first_run else "INCREMENTAL_SYNC",
+        total_extracted=final_stats["total_laboratorios"],
         new_records=len(new_lab_ids) + new_eq,
         updated_records=upd_labs_count + upd_eq,
         status="SUCCESS",
@@ -144,26 +150,25 @@ def run_pipeline(
     logger.info("\n==================================================")
     logger.info("            RESUMO FINAL DO BANCO SQL             ")
     logger.info("==================================================")
-    logger.info(f"Total de Laboratórios no Banco: {stats['total_laboratorios']}")
-    logger.info(f"Laboratórios com Detalhes/Equipamentos Sincronizados: {stats['laboratorios_enriquecidos']}")
-    logger.info(f"Laboratórios Pendentes: {stats['laboratorios_pendentes']}")
-    logger.info(f"Total de Equipamentos Registrados: {stats['total_equipamentos']}")
-    logger.info(f"Novos laboratórios adicionados nesta execução: {len(new_lab_ids)}")
-    logger.info(f"Novos equipamentos adicionados nesta execução: {new_eq}")
+    logger.info(f"Total de Laboratórios no Banco: {final_stats['total_laboratorios']}")
+    logger.info(f"Laboratórios com Detalhes/Equipamentos Salvos: {final_stats['laboratorios_enriquecidos']}")
+    logger.info(f"Total de Equipamentos no Banco: {final_stats['total_equipamentos']}")
+    logger.info(f"Novos laboratórios inseridos nesta execução: {len(new_lab_ids)}")
+    logger.info(f"Novos equipamentos inseridos nesta execução: {new_eq}")
     logger.info(f"Duração total: {duration:.2f} segundos ({duration/60:.2f} min)")
-    logger.info(f"Banco SQLite salvo em: {DATABASE_PATH}")
+    logger.info(f"Banco SQLite: {DATABASE_PATH}")
     logger.info("==================================================")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Automação de Scraping Incremental PNIPE/MCTI para SQLite")
-    parser.add_argument("--test", action="store_true", help="Modo teste: extrai 2 páginas e enriquece 10 laboratórios")
-    parser.add_argument("--max-pages", type=int, default=None, help="Limite de páginas na etapa 1")
-    parser.add_argument("--max-enrich", type=int, default=None, help="Limite de laboratórios para enriquecer na etapa 2")
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Número de threads simultâneas para enriquecimento")
-    parser.add_argument("--all", action="store_true", help="Força a atualização de detalhes e equipamentos de TODOS os laboratórios do banco")
+    parser = argparse.ArgumentParser(description="Automação PNIPE/MCTI: Carga Inicial Completa e Incremento Mensal por idAsset")
+    parser.add_argument("--test", action="store_true", help="Modo teste rápido: 2 páginas e 10 laboratórios")
+    parser.add_argument("--max-pages", type=int, default=None, help="Limite de páginas na listagem")
+    parser.add_argument("--max-enrich", type=int, default=None, help="Limite de laboratórios para enriquecer")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Número de threads simultâneas")
+    parser.add_argument("--all", action="store_true", help="Força a re-raspagem de todos os laboratórios do banco")
     parser.add_argument("--skip-enrichment", action="store_true", help="Pula a etapa de detalhes e equipamentos")
-    parser.add_argument("--no-csv", action="store_true", help="Não gera arquivos CSV auxiliares")
+    parser.add_argument("--no-csv", action="store_true", help="Não gera arquivos CSV")
 
     args = parser.parse_args()
 
