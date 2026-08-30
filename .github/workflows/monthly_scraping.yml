@@ -1,0 +1,44 @@
+name: Automação Mensal de Scraping PNIPE
+
+on:
+  schedule:
+    # Executa às 03:00 UTC no dia 1 de cada mês
+    - cron: '0 3 1 * *'
+  workflow_dispatch: # Permite disparar manualmente pelo painel do GitHub Actions
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout do Repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar Dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Executar Pipeline de Scraping
+        run: |
+          python main.py
+
+      - name: Commit e Push dos Dados Atualizados
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "Nenhuma alteração nos dados detectada."
+          else
+            git commit -m "chore(data): atualização mensal dos dados PNIPE [skip ci]"
+            git push
+          fi
