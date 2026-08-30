@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout do Repositório
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Configurar Python
         uses: actions/setup-python@v5
@@ -40,5 +42,6 @@ jobs:
             echo "Nenhuma alteração nos dados detectada."
           else
             git commit -m "chore(data): atualização mensal dos dados PNIPE [skip ci]"
-            git push
+            git pull --rebase origin main
+            git push origin main
           fi
