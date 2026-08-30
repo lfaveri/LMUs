@@ -12,7 +12,6 @@ from src.config import (
     PAGE_SIZE,
     EQUIPMENTS_PAGE_SIZE,
     REQUEST_TIMEOUT,
-    MAX_RETRIES,
     BACKOFF_FACTOR,
     DELAY_BETWEEN_PAGES,
     DEFAULT_WORKERS,
@@ -28,17 +27,20 @@ logger = logging.getLogger(__name__)
 
 
 def create_resilient_session() -> requests.Session:
-    """Cria uma sessão requests com retries automáticos e headers padronizados."""
+    """Cria uma sessão requests com pool de conexões e retries resilientes."""
     session = requests.Session()
     session.headers.update(HEADERS)
 
+    # Retries apenas para quedas transitórias (429, 502, 503, 504).
+    # Não inclui 500 para evitar loops em endpoints com bugs de mapeamento na API do governo.
     retry_strategy = Retry(
-        total=MAX_RETRIES,
+        total=3,
         backoff_factor=BACKOFF_FACTOR,
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[429, 502, 503, 504],
+        raise_on_status=False,
         allowed_methods=["POST", "GET"]
     )
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=30, pool_maxsize=30)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -72,11 +74,13 @@ def fetch_pnipe_laboratorios(
         url = f"{API_BASE_URL}?page={page}&size={page_size}"
         try:
             response = session.post(url, data="{}", timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            if response.status_code != 200:
+                logger.warning(f"Status {response.status_code} na página {page}.")
+                break
             data = response.json()
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error(f"Erro ao requisitar página {page}: {e}")
-            raise
+            break
 
         if not isinstance(data, dict):
             logger.warning(f"Resposta inesperada na página {page}. Encerrando.")
@@ -119,6 +123,7 @@ def fetch_single_lab_detail_and_equipments(
 ) -> Tuple[int, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Coleta os detalhes completos e a lista de equipamentos de um laboratório específico.
+    Trata erros e respostas com falhas (ex: 500 do servidor) sem interromper a execução.
     """
     sess = session or create_resilient_session()
     
@@ -130,9 +135,9 @@ def fetch_single_lab_detail_and_equipments(
         if res_lab.status_code == 200:
             lab_detail = res_lab.json()
         else:
-            logger.warning(f"Laboratório ID {lab_id}: Status {res_lab.status_code} ao buscar detalhes.")
+            logger.debug(f"Laboratório ID {lab_id}: Status {res_lab.status_code} ao buscar detalhes.")
     except Exception as e:
-        logger.error(f"Erro ao buscar detalhes do laboratório {lab_id}: {e}")
+        logger.debug(f"Aviso no laboratório {lab_id} (detalhes): {e}")
 
     # 2. Requisição dos Equipamentos do Laboratório
     equipments = []
@@ -145,8 +150,10 @@ def fetch_single_lab_detail_and_equipments(
                 equipments = eq_json.get("content", [])
             elif isinstance(eq_json, list):
                 equipments = eq_json
+        else:
+            logger.debug(f"Laboratório ID {lab_id}: Status {res_eq.status_code} ao buscar equipamentos.")
     except Exception as e:
-        logger.error(f"Erro ao buscar equipamentos do laboratório {lab_id}: {e}")
+        logger.debug(f"Aviso no laboratório {lab_id} (equipamentos): {e}")
 
     return lab_id, lab_detail, equipments
 
@@ -158,7 +165,7 @@ def enrich_laboratories(
 ) -> Tuple[int, int, int]:
     """
     Executa o enriquecimento de detalhes e equipamentos de múltiplos laboratórios
-    utilizando pool concorrente de threads e salvando diretamente no SQLite.
+    utilizando pool concorrente de threads e persistindo diretamente no SQLite.
     Retorna (total_processados, total_equipamentos_novos, total_equipamentos_atualizados).
     """
     if not lab_ids:
@@ -187,7 +194,7 @@ def enrich_laboratories(
                 total_new_eq += new_eq
                 total_upd_eq += upd_eq
             except Exception as e:
-                logger.error(f"Erro ao processar e salvar dados do laboratório {lab_id}: {e}")
+                logger.error(f"Erro ao salvar dados do laboratório {lab_id}: {e}")
 
             processed_count += 1
             if processed_count % batch_log_interval == 0 or processed_count == total:
